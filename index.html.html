@@ -1,0 +1,1375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#0F6E74">
+<title>Peptide Tracker</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<style>body{margin:0;background:#EEF2F5} input,select,textarea{font-size:16px}</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+window.storage = {
+  get: async (key) => { const v = localStorage.getItem(key); if (v === null) throw new Error('not found'); return { key, value: v, shared: false }; },
+  set: async (key, value) => { localStorage.setItem(key, value); return { key, value, shared: false }; },
+  delete: async (key) => { localStorage.removeItem(key); return { key, deleted: true, shared: false }; },
+  list: async () => ({ keys: Object.keys(localStorage), shared: false })
+};
+window.addEventListener('error', (e) => { const r=document.getElementById('root'); if (r && !r.children.length) r.innerHTML='<div style="padding:20px;font-family:system-ui;color:#A8262B">App failed to start: '+(e.message||'unknown error')+'</div>'; });
+</script>
+<script>
+const {
+  useState,
+  useEffect
+} = React;
+
+// ---------- helpers ----------
+const STORE_KEY = "peptide_tracker_v1";
+const APP_VERSION = "1.3";
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const SITES = ["Abdomen L", "Abdomen R", "Thigh L", "Thigh R", "Glute L", "Glute R", "Arm L", "Arm R"];
+const C = {
+  bg: "#EEF2F5",
+  ink: "#17232B",
+  mute: "#5F6E78",
+  line: "#D5DDE3",
+  card: "#FFFFFF",
+  teal: "#0F6E74",
+  tealSoft: "#DCEFF0",
+  amber: "#B4560A",
+  amberSoft: "#FBEBD6",
+  red: "#A8262B"
+};
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const toISO = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const fromISO = s => {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d);
+};
+const fmt = (n, p = 1) => Number.isFinite(n) ? Number(n.toFixed(p)).toString() : "—";
+const addDays = (iso, n) => {
+  const d = fromISO(iso);
+  d.setDate(d.getDate() + n);
+  return toISO(d);
+};
+const conc = p => p.vialMg && p.waterMl ? p.vialMg / p.waterMl : 0;
+const unitsFor = (p, doseMg) => conc(p) ? doseMg / conc(p) * 100 : 0; // U-100 syringe: 100 units = 1 mL
+const mlFor = (p, doseMg) => conc(p) ? doseMg / conc(p) : 0;
+
+// Which phase applies on a given date (weeks count within the on/off cycle)
+function phaseOn(p, iso) {
+  if (!p.startDate) return null;
+  const diff = Math.floor((fromISO(iso) - fromISO(p.startDate)) / 86400000);
+  if (diff < 0) return null;
+  const week = Math.floor(diff / 7) + 1;
+  const on = Number(p.onWeeks) || 0,
+    off = Number(p.offWeeks) || 0;
+  const cycleLen = on + off;
+  const wk = cycleLen ? (week - 1) % cycleLen + 1 : week;
+  if (on && wk > on) return {
+    off: true,
+    week,
+    wk
+  };
+  const ph = p.phases.find(x => wk >= Number(x.startWeek) && wk <= Number(x.endWeek));
+  return ph ? {
+    ...ph,
+    week,
+    wk
+  } : null;
+}
+const dueOn = (p, iso) => {
+  const ph = phaseOn(p, iso);
+  return ph && !ph.off && ph.days.includes(fromISO(iso).getDay()) ? ph : null;
+};
+function supply(p, iso) {
+  const ph = phaseOn(p, iso);
+  const dose = ph && !ph.off ? Number(ph.doseMg) : Number(p.phases[0]?.doseMg) || 0;
+  const perWeek = ph && !ph.off ? ph.days.length : p.phases[0]?.days.length || 0;
+  const openMl = p.vialOpened ? Math.max(0, p.waterMl - (p.vialUsedMl || 0)) : 0;
+  const openDraws = dose ? Math.floor(mlFor(p, 1) > 0 ? openMl / mlFor(p, dose) : 0) : 0;
+  const sealedDraws = dose ? Math.floor(p.waterMl / mlFor(p, dose)) * (Number(p.vialsOnHand) || 0) : 0;
+  const total = openDraws + sealedDraws;
+  const weeks = perWeek ? total / perWeek : Infinity;
+  const expires = p.vialOpened ? addDays(p.vialOpened, Number(p.expiryDays) || 28) : null;
+  const daysToExpiry = expires ? Math.floor((fromISO(expires) - fromISO(iso)) / 86400000) : null;
+  return {
+    dose,
+    perWeek,
+    openMl,
+    openDraws,
+    sealedDraws,
+    total,
+    weeks,
+    expires,
+    daysToExpiry
+  };
+}
+const blankPhase = () => ({
+  id: uid(),
+  label: "",
+  startWeek: 1,
+  endWeek: 4,
+  doseMg: "",
+  days: [1, 2, 3, 4, 5]
+});
+const blankProduct = () => ({
+  id: uid(),
+  name: "",
+  form: "lyophilized",
+  components: [{
+    name: "",
+    mg: ""
+  }],
+  vialMg: "",
+  waterMl: "",
+  concMgMl: "",
+  route: "Subcutaneous",
+  timing: "AM",
+  startDate: toISO(new Date()),
+  onWeeks: 12,
+  offWeeks: 4,
+  expiryDays: 28,
+  vialsOnHand: 0,
+  vialOpened: "",
+  vialUsedMl: 0,
+  notes: "",
+  phases: [blankPhase()]
+});
+
+// ---------- small UI bits ----------
+const Field = ({
+  label,
+  hint,
+  children
+}) => /*#__PURE__*/React.createElement("label", {
+  className: "block mb-4"
+}, /*#__PURE__*/React.createElement("div", {
+  className: "text-sm mb-1",
+  style: {
+    color: C.ink
+  }
+}, label), children, hint && /*#__PURE__*/React.createElement("div", {
+  className: "text-xs mt-1",
+  style: {
+    color: C.mute
+  }
+}, hint));
+const inputStyle = {
+  border: `1px solid ${C.line}`,
+  background: "#fff",
+  color: C.ink
+};
+const Input = props => /*#__PURE__*/React.createElement("input", {
+  ...props,
+  className: "w-full rounded-lg px-3 py-2 text-base " + (props.className || ""),
+  style: inputStyle
+});
+const Select = props => /*#__PURE__*/React.createElement("select", {
+  ...props,
+  className: "w-full rounded-lg px-3 py-2 text-base",
+  style: inputStyle
+});
+const Btn = ({
+  kind = "primary",
+  children,
+  ...r
+}) => {
+  const s = kind === "primary" ? {
+    background: C.teal,
+    color: "#fff"
+  } : kind === "danger" ? {
+    background: "#fff",
+    color: C.red,
+    border: `1px solid ${C.red}`
+  } : {
+    background: "#fff",
+    color: C.ink,
+    border: `1px solid ${C.line}`
+  };
+  return /*#__PURE__*/React.createElement("button", {
+    ...r,
+    className: "rounded-lg px-4 py-2 text-sm font-medium " + (r.className || ""),
+    style: {
+      ...s,
+      ...(r.style || {})
+    }
+  }, children);
+};
+const Card = ({
+  children,
+  style,
+  onClick
+}) => /*#__PURE__*/React.createElement("div", {
+  onClick: onClick,
+  className: "rounded-xl p-4 mb-3",
+  style: {
+    background: C.card,
+    border: `1px solid ${C.line}`,
+    ...style
+  }
+}, children);
+const Tag = ({
+  children,
+  tone = "teal"
+}) => /*#__PURE__*/React.createElement("span", {
+  className: "text-xs rounded-full px-2 py-0.5",
+  style: tone === "amber" ? {
+    background: C.amberSoft,
+    color: C.amber
+  } : {
+    background: C.tealSoft,
+    color: C.teal
+  }
+}, children);
+
+// ---------- Product form ----------
+function ProductForm({
+  initial,
+  onSave,
+  onCancel
+}) {
+  const [p, setP] = useState(initial || blankProduct());
+  const set = (k, v) => setP(x => ({
+    ...x,
+    [k]: v
+  }));
+  const setComp = (i, k, v) => setP(x => {
+    const c = [...x.components];
+    c[i] = {
+      ...c[i],
+      [k]: v
+    };
+    return {
+      ...x,
+      components: c
+    };
+  });
+  const setPhase = (i, k, v) => setP(x => {
+    const ph = [...x.phases];
+    ph[i] = {
+      ...ph[i],
+      [k]: v
+    };
+    return {
+      ...x,
+      phases: ph
+    };
+  });
+  const toggleDay = (i, d) => setPhase(i, "days", p.phases[i].days.includes(d) ? p.phases[i].days.filter(x => x !== d) : [...p.phases[i].days, d].sort());
+  const compTotal = p.components.reduce((a, c) => a + (Number(c.mg) || 0), 0);
+  const cc = conc({
+    vialMg: Number(p.vialMg),
+    waterMl: Number(p.waterMl)
+  });
+  const valid = p.name && Number(p.vialMg) > 0 && Number(p.waterMl) > 0 && p.phases.every(x => Number(x.doseMg) > 0 && x.days.length);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "pb-24"
+  }, /*#__PURE__*/React.createElement("h2", {
+    className: "text-xl font-semibold mb-4",
+    style: {
+      color: C.ink
+    }
+  }, initial ? "Edit product" : "Add a product"), /*#__PURE__*/React.createElement(Section, {
+    title: "Product"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Name"
+  }, /*#__PURE__*/React.createElement(Input, {
+    value: p.name,
+    onChange: e => set("name", e.target.value),
+    placeholder: "Name as it appears on the vial"
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Components",
+    hint: p.form === "solution" ? "Active ingredient(s). mg is optional for a single-ingredient solution." : "For a blend, list each peptide and its mg per vial. Single peptides: one row."
+  }, p.components.map((c, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "flex gap-2 mb-2"
+  }, /*#__PURE__*/React.createElement(Input, {
+    value: c.name,
+    onChange: e => setComp(i, "name", e.target.value),
+    placeholder: "Peptide"
+  }), /*#__PURE__*/React.createElement(Input, {
+    value: c.mg,
+    onChange: e => setComp(i, "mg", e.target.value),
+    placeholder: "mg",
+    type: "number",
+    inputMode: "decimal",
+    style: {
+      ...inputStyle,
+      width: 90
+    }
+  }), p.components.length > 1 && /*#__PURE__*/React.createElement("button", {
+    onClick: () => set("components", p.components.filter((_, j) => j !== i)),
+    className: "text-sm px-2",
+    style: {
+      color: C.mute
+    }
+  }, "✕"))), /*#__PURE__*/React.createElement("button", {
+    onClick: () => set("components", [...p.components, {
+      name: "",
+      mg: ""
+    }]),
+    className: "text-sm",
+    style: {
+      color: C.teal
+    }
+  }, "+ Add component")), /*#__PURE__*/React.createElement(Field, {
+    label: "Vial type"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, [["lyophilized", "Powder, needs mixing"], ["solution", "Ready-to-use liquid"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    onClick: () => set("form", k),
+    className: "flex-1 rounded-lg py-2 text-sm font-medium",
+    style: p.form === k ? {
+      background: C.teal,
+      color: "#fff"
+    } : {
+      background: "#fff",
+      color: C.mute,
+      border: `1px solid ${C.line}`
+    }
+  }, l)))), p.form === "solution" ? /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Concentration (mg/mL)"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "decimal",
+    value: p.concMgMl,
+    onChange: e => {
+      const v = e.target.value;
+      setP(x => ({
+        ...x,
+        concMgMl: v,
+        vialMg: Number(v) * Number(x.waterMl) || ""
+      }));
+    },
+    placeholder: "200"
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Vial volume (mL)"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "decimal",
+    value: p.waterMl,
+    onChange: e => {
+      const v = e.target.value;
+      setP(x => ({
+        ...x,
+        waterMl: v,
+        vialMg: Number(x.concMgMl) * Number(v) || ""
+      }));
+    },
+    placeholder: "1"
+  }))) : /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Vial total (mg)"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "decimal",
+    value: p.vialMg,
+    onChange: e => set("vialMg", e.target.value),
+    placeholder: compTotal ? String(compTotal) : "80"
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Bacteriostatic water (mL)"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "decimal",
+    value: p.waterMl,
+    onChange: e => set("waterMl", e.target.value),
+    placeholder: "2"
+  }))), cc > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm -mt-2 mb-3",
+    style: {
+      color: C.teal
+    }
+  }, p.form === "solution" ? `${fmt(Number(p.vialMg), 1)} mg per vial` : `Concentration ${fmt(cc, 2)} mg/mL`, " · 1 unit (0.01 mL) = ", fmt(cc / 100, 3), " mg"), p.form !== "solution" && compTotal > 0 && Number(p.vialMg) > 0 && Math.abs(compTotal - Number(p.vialMg)) > 0.01 && /*#__PURE__*/React.createElement("div", {
+    className: "text-xs mb-3",
+    style: {
+      color: C.amber
+    }
+  }, "Components add to ", compTotal, " mg but vial total is ", p.vialMg, " mg. Check one of them."), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Route"
+  }, /*#__PURE__*/React.createElement(Select, {
+    value: p.route,
+    onChange: e => set("route", e.target.value)
+  }, /*#__PURE__*/React.createElement("option", null, "Subcutaneous"), /*#__PURE__*/React.createElement("option", null, "Intramuscular"), /*#__PURE__*/React.createElement("option", null, "Oral"), /*#__PURE__*/React.createElement("option", null, "Nasal"))), /*#__PURE__*/React.createElement(Field, {
+    label: "Timing"
+  }, /*#__PURE__*/React.createElement(Select, {
+    value: p.timing,
+    onChange: e => set("timing", e.target.value)
+  }, /*#__PURE__*/React.createElement("option", null, "AM"), /*#__PURE__*/React.createElement("option", null, "PM"), /*#__PURE__*/React.createElement("option", null, "Pre-bed"), /*#__PURE__*/React.createElement("option", null, "Any"))))), /*#__PURE__*/React.createElement(Section, {
+    title: "Schedule"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Start date"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "date",
+    value: p.startDate,
+    onChange: e => set("startDate", e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Weeks on"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "numeric",
+    value: p.onWeeks,
+    onChange: e => set("onWeeks", e.target.value)
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Weeks off",
+    hint: "0 for no off period"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "numeric",
+    value: p.offWeeks,
+    onChange: e => set("offWeeks", e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "text-sm mb-2",
+    style: {
+      color: C.ink
+    }
+  }, "Phases ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.mute
+    }
+  }, "(weeks count within the on period)")), p.phases.map((ph, i) => {
+    const u = cc ? Number(ph.doseMg) / cc * 100 : 0;
+    return /*#__PURE__*/React.createElement("div", {
+      key: ph.id,
+      className: "rounded-lg p-3 mb-3",
+      style: {
+        background: C.bg
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex gap-2 mb-2"
+    }, /*#__PURE__*/React.createElement(Input, {
+      value: ph.label,
+      onChange: e => setPhase(i, "label", e.target.value),
+      placeholder: `Phase ${i + 1} (e.g. Loading)`
+    }), p.phases.length > 1 && /*#__PURE__*/React.createElement("button", {
+      onClick: () => set("phases", p.phases.filter((_, j) => j !== i)),
+      className: "text-sm px-2",
+      style: {
+        color: C.mute
+      }
+    }, "✕")), /*#__PURE__*/React.createElement("div", {
+      className: "flex gap-2 mb-2 items-center"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "text-sm",
+      style: {
+        color: C.mute
+      }
+    }, "Weeks"), /*#__PURE__*/React.createElement(Input, {
+      type: "number",
+      inputMode: "numeric",
+      value: ph.startWeek,
+      onChange: e => setPhase(i, "startWeek", e.target.value),
+      style: {
+        ...inputStyle,
+        width: 64
+      }
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: C.mute
+      }
+    }, "to"), /*#__PURE__*/React.createElement(Input, {
+      type: "number",
+      inputMode: "numeric",
+      value: ph.endWeek,
+      onChange: e => setPhase(i, "endWeek", e.target.value),
+      style: {
+        ...inputStyle,
+        width: 64
+      }
+    }), /*#__PURE__*/React.createElement("span", {
+      className: "text-sm ml-2",
+      style: {
+        color: C.mute
+      }
+    }, "Dose mg"), /*#__PURE__*/React.createElement(Input, {
+      type: "number",
+      inputMode: "decimal",
+      value: ph.doseMg,
+      onChange: e => setPhase(i, "doseMg", e.target.value),
+      style: {
+        ...inputStyle,
+        width: 80
+      }
+    })), u > 0 && /*#__PURE__*/React.createElement("div", {
+      className: "text-sm mb-2",
+      style: {
+        color: C.teal
+      }
+    }, "= ", fmt(u), " units on a U-100 syringe"), /*#__PURE__*/React.createElement("div", {
+      className: "flex gap-1"
+    }, DAYS.map((d, di) => /*#__PURE__*/React.createElement("button", {
+      key: d,
+      onClick: () => toggleDay(i, di),
+      className: "flex-1 rounded-md py-1 text-xs font-medium",
+      style: ph.days.includes(di) ? {
+        background: C.teal,
+        color: "#fff"
+      } : {
+        background: "#fff",
+        color: C.mute,
+        border: `1px solid ${C.line}`
+      }
+    }, d))));
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      const last = p.phases[p.phases.length - 1];
+      set("phases", [...p.phases, {
+        ...blankPhase(),
+        startWeek: Number(last.endWeek) + 1,
+        endWeek: Number(last.endWeek) + 4,
+        days: last.days
+      }]);
+    },
+    className: "text-sm",
+    style: {
+      color: C.teal
+    }
+  }, "+ Add phase")), /*#__PURE__*/React.createElement(Section, {
+    title: "Inventory"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Sealed vials on hand"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "numeric",
+    value: p.vialsOnHand,
+    onChange: e => set("vialsOnHand", e.target.value)
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: p.form === "solution" ? "Days usable after opening" : "Days usable after mixing"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "numeric",
+    value: p.expiryDays,
+    onChange: e => set("expiryDays", e.target.value)
+  }))), /*#__PURE__*/React.createElement(Field, {
+    label: p.form === "solution" ? "Current vial opened on" : "Current vial mixed on",
+    hint: "Leave blank if no vial is open yet."
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "date",
+    value: p.vialOpened,
+    onChange: e => set("vialOpened", e.target.value)
+  })), p.vialOpened && /*#__PURE__*/React.createElement(Field, {
+    label: "mL already used from it"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "decimal",
+    value: p.vialUsedMl,
+    onChange: e => set("vialUsedMl", e.target.value)
+  }))), /*#__PURE__*/React.createElement(Section, {
+    title: "Injection notes"
+  }, /*#__PURE__*/React.createElement("textarea", {
+    value: p.notes,
+    onChange: e => set("notes", e.target.value),
+    rows: 4,
+    placeholder: "Reconstitution steps, site preferences, storage, anything you want on the card.",
+    className: "w-full rounded-lg px-3 py-2 text-base",
+    style: inputStyle
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "fixed bottom-16 left-0 right-0 p-3 flex gap-2",
+    style: {
+      background: C.bg,
+      borderTop: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: onCancel,
+    className: "flex-1"
+  }, "Cancel"), /*#__PURE__*/React.createElement(Btn, {
+    disabled: !valid,
+    onClick: () => onSave({
+      ...p,
+      vialMg: Number(p.vialMg),
+      waterMl: Number(p.waterMl),
+      vialsOnHand: Number(p.vialsOnHand) || 0,
+      vialUsedMl: Number(p.vialUsedMl) || 0,
+      components: p.components.filter(c => c.name).map(c => ({
+        ...c,
+        mg: Number(c.mg) || 0
+      }))
+    }),
+    className: "flex-1",
+    style: {
+      opacity: valid ? 1 : 0.4
+    }
+  }, "Save product")));
+}
+const Section = ({
+  title,
+  children
+}) => /*#__PURE__*/React.createElement("div", {
+  className: "mb-5"
+}, /*#__PURE__*/React.createElement("div", {
+  className: "font-semibold mb-2",
+  style: {
+    color: C.ink
+  }
+}, title), /*#__PURE__*/React.createElement(Card, null, children));
+
+// ---------- Log modal ----------
+function LogModal({
+  product,
+  phase,
+  iso,
+  onSave,
+  onClose
+}) {
+  const [dose, setDose] = useState(phase?.doseMg ?? product.phases[0]?.doseMg ?? "");
+  const [site, setSite] = useState(SITES[0]);
+  const [time, setTime] = useState(() => {
+    const d = new Date();
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  });
+  const [notes, setNotes] = useState("");
+  const u = unitsFor(product, Number(dose));
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fixed inset-0 flex items-end",
+    style: {
+      background: "rgba(23,35,43,0.45)",
+      zIndex: 50
+    },
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "w-full rounded-t-2xl p-5",
+    style: {
+      background: C.card
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-lg font-semibold mb-1",
+    style: {
+      color: C.ink
+    }
+  }, "Log ", product.name), /*#__PURE__*/React.createElement("div", {
+    className: "text-sm mb-4",
+    style: {
+      color: C.mute
+    }
+  }, iso), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-3"
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Dose (mg)"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "number",
+    inputMode: "decimal",
+    value: dose,
+    onChange: e => setDose(e.target.value)
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Time"
+  }, /*#__PURE__*/React.createElement(Input, {
+    type: "time",
+    value: time,
+    onChange: e => setTime(e.target.value)
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "text-2xl font-semibold mb-4",
+    style: {
+      color: C.teal
+    }
+  }, fmt(u), " units ", /*#__PURE__*/React.createElement("span", {
+    className: "text-sm font-normal",
+    style: {
+      color: C.mute
+    }
+  }, "(", fmt(mlFor(product, Number(dose)), 3), " mL)")), /*#__PURE__*/React.createElement(Field, {
+    label: "Site"
+  }, /*#__PURE__*/React.createElement(Select, {
+    value: site,
+    onChange: e => setSite(e.target.value)
+  }, SITES.map(s => /*#__PURE__*/React.createElement("option", {
+    key: s
+  }, s)))), /*#__PURE__*/React.createElement(Field, {
+    label: "Notes"
+  }, /*#__PURE__*/React.createElement(Input, {
+    value: notes,
+    onChange: e => setNotes(e.target.value),
+    placeholder: "How it felt, anything unusual"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    className: "flex-1",
+    onClick: () => onSave({
+      status: "skipped",
+      doseMg: 0,
+      units: 0,
+      site: "",
+      time,
+      notes
+    })
+  }, "Mark skipped"), /*#__PURE__*/React.createElement(Btn, {
+    className: "flex-1",
+    onClick: () => onSave({
+      status: "done",
+      doseMg: Number(dose),
+      units: u,
+      site,
+      time,
+      notes
+    })
+  }, "Save injection"))));
+}
+
+// ---------- Product card ----------
+function ProductCard({
+  p,
+  iso,
+  entries,
+  onEdit,
+  onDelete,
+  onNewVial
+}) {
+  const [open, setOpen] = useState(false);
+  const ph = phaseOn(p, iso);
+  const s = supply(p, iso);
+  const lastSite = entries.filter(e => e.productId === p.id && e.status === "done").sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time))[0]?.site;
+  const warn = s.total <= s.perWeek * 2 || s.daysToExpiry !== null && s.daysToExpiry <= 5;
+  return /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+    onClick: () => setOpen(!open)
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between items-start"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "text-lg font-semibold",
+    style: {
+      color: C.ink
+    }
+  }, p.name), /*#__PURE__*/React.createElement("div", {
+    className: "text-sm",
+    style: {
+      color: C.mute
+    }
+  }, fmt(conc(p), 2), " mg/mL · ", p.form === "solution" ? `${p.waterMl} mL ready-to-use vial` : `${p.vialMg} mg in ${p.waterMl} mL`)), ph ? ph.off ? /*#__PURE__*/React.createElement(Tag, {
+    tone: "amber"
+  }, "Off week ", ph.wk - Number(p.onWeeks)) : /*#__PURE__*/React.createElement(Tag, null, ph.label || "Phase", " · wk ", ph.wk) : /*#__PURE__*/React.createElement(Tag, {
+    tone: "amber"
+  }, "Not started")), ph && !ph.off && /*#__PURE__*/React.createElement("div", {
+    className: "flex items-end gap-3 mt-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-4xl font-semibold",
+    style: {
+      color: C.teal,
+      lineHeight: 1
+    }
+  }, fmt(unitsFor(p, Number(ph.doseMg)))), /*#__PURE__*/React.createElement("div", {
+    className: "text-sm pb-0.5",
+    style: {
+      color: C.mute
+    }
+  }, "units (", fmt(mlFor(p, Number(ph.doseMg)), 2), " mL) · ", ph.doseMg, " mg · ", ph.days.map(d => DAYS[d]).join(" "), " · ", p.timing)), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 h-1.5 rounded-full overflow-hidden",
+    style: {
+      background: C.bg
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "h-full",
+    style: {
+      width: `${p.vialOpened ? s.openMl / p.waterMl * 100 : 0}%`,
+      background: warn ? C.amber : C.teal
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between text-xs mt-1",
+    style: {
+      color: warn ? C.amber : C.mute
+    }
+  }, /*#__PURE__*/React.createElement("span", null, p.vialOpened ? `${fmt(s.openMl, 2)} mL left · ${s.openDraws} draws` : "No vial open", s.expires ? ` · expires ${s.expires}` : ""), /*#__PURE__*/React.createElement("span", null, p.vialsOnHand, " sealed · ", Number.isFinite(s.weeks) ? `~${fmt(s.weeks)} wk supply` : ""))), open && /*#__PURE__*/React.createElement("div", {
+    className: "mt-4 pt-4",
+    style: {
+      borderTop: `1px solid ${C.line}`
+    }
+  }, p.components.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mb-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-sm font-medium mb-1",
+    style: {
+      color: C.ink
+    }
+  }, "Per dose", ph && !ph.off ? ` at ${ph.doseMg} mg` : ""), p.components.map((c, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "flex justify-between text-sm py-1",
+    style: {
+      color: C.mute,
+      borderBottom: `1px solid ${C.bg}`
+    }
+  }, /*#__PURE__*/React.createElement("span", null, c.name), /*#__PURE__*/React.createElement("span", null, c.mg ? `${c.mg} mg/vial` : "", c.mg && ph && !ph.off ? ` · ${fmt(c.mg / p.vialMg * Number(ph.doseMg), 3)} mg/dose` : "")))), /*#__PURE__*/React.createElement("div", {
+    className: "mb-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-sm font-medium mb-1",
+    style: {
+      color: C.ink
+    }
+  }, "Schedule · ", p.onWeeks, " on / ", p.offWeeks, " off · from ", p.startDate), p.phases.map(x => /*#__PURE__*/React.createElement("div", {
+    key: x.id,
+    className: "flex justify-between text-sm py-1",
+    style: {
+      color: C.mute,
+      borderBottom: `1px solid ${C.bg}`
+    }
+  }, /*#__PURE__*/React.createElement("span", null, x.label || "Phase", " · wk ", x.startWeek, "–", x.endWeek), /*#__PURE__*/React.createElement("span", null, x.doseMg, " mg = ", fmt(unitsFor(p, Number(x.doseMg))), " u · ", x.days.length, "x/wk")))), /*#__PURE__*/React.createElement("div", {
+    className: "text-sm mb-1",
+    style: {
+      color: C.mute
+    }
+  }, "Route ", p.route, " · ", p.timing, " · use within ", p.expiryDays, " days of ", p.form === "solution" ? "opening" : "mixing", lastSite ? ` · last site ${lastSite}` : ""), p.notes && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm whitespace-pre-wrap mt-2 mb-3",
+    style: {
+      color: C.ink
+    }
+  }, p.notes), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 mt-3"
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: onNewVial
+  }, "Open new vial"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: onEdit
+  }, "Edit"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "danger",
+    onClick: onDelete
+  }, "Delete"))));
+}
+
+// ---------- Calendar ----------
+function Calendar({
+  products,
+  entries,
+  today,
+  onLog
+}) {
+  const [month, setMonth] = useState(() => {
+    const d = fromISO(today);
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  });
+  const [sel, setSel] = useState(today);
+  const first = month.getDay();
+  const nDays = new Date(month.getFullYear(), month.getMonth() + 1, 0).getDate();
+  const cells = [...Array(first).fill(null), ...Array.from({
+    length: nDays
+  }, (_, i) => toISO(new Date(month.getFullYear(), month.getMonth(), i + 1)))];
+  const due = iso => products.filter(p => dueOn(p, iso));
+  const logged = (iso, pid) => entries.find(e => e.date === iso && e.productId === pid);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between items-center mb-3"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1)),
+    className: "px-3 py-1 text-lg",
+    style: {
+      color: C.teal
+    }
+  }, "‹"), /*#__PURE__*/React.createElement("div", {
+    className: "font-semibold",
+    style: {
+      color: C.ink
+    }
+  }, month.toLocaleString("en-US", {
+    month: "long",
+    year: "numeric"
+  })), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1)),
+    className: "px-3 py-1 text-lg",
+    style: {
+      color: C.teal
+    }
+  }, "›")), /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-7 gap-1 mb-1"
+  }, DAYS.map(d => /*#__PURE__*/React.createElement("div", {
+    key: d,
+    className: "text-center text-xs",
+    style: {
+      color: C.mute
+    }
+  }, d))), /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-7 gap-1"
+  }, cells.map((iso, i) => {
+    if (!iso) return /*#__PURE__*/React.createElement("div", {
+      key: i
+    });
+    const d = due(iso);
+    const isSel = iso === sel,
+      isToday = iso === today;
+    return /*#__PURE__*/React.createElement("button", {
+      key: iso,
+      onClick: () => setSel(iso),
+      className: "rounded-lg py-1.5 flex flex-col items-center",
+      style: {
+        background: isSel ? C.teal : isToday ? C.tealSoft : C.card,
+        color: isSel ? "#fff" : C.ink,
+        border: `1px solid ${isSel ? C.teal : C.line}`
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "text-sm"
+    }, Number(iso.slice(-2))), /*#__PURE__*/React.createElement("span", {
+      className: "flex gap-0.5 h-1.5 mt-0.5"
+    }, d.map(p => {
+      const e = logged(iso, p.id);
+      return /*#__PURE__*/React.createElement("span", {
+        key: p.id,
+        className: "w-1.5 h-1.5 rounded-full",
+        style: {
+          background: isSel ? "#fff" : e?.status === "done" ? C.teal : e?.status === "skipped" ? C.amber : "transparent",
+          border: `1px solid ${isSel ? "#fff" : C.teal}`
+        }
+      });
+    })));
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "mt-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "font-semibold mb-2",
+    style: {
+      color: C.ink
+    }
+  }, fromISO(sel).toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric"
+  })), due(sel).length === 0 && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm",
+    style: {
+      color: C.mute
+    }
+  }, "Nothing scheduled."), due(sel).map(p => {
+    const ph = dueOn(p, sel);
+    const e = logged(sel, p.id);
+    return /*#__PURE__*/React.createElement(Card, {
+      key: p.id
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between items-center"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      className: "font-medium",
+      style: {
+        color: C.ink
+      }
+    }, p.name), /*#__PURE__*/React.createElement("div", {
+      className: "text-sm",
+      style: {
+        color: C.mute
+      }
+    }, ph.doseMg, " mg · ", fmt(unitsFor(p, Number(ph.doseMg))), " units · ", p.timing)), e ? /*#__PURE__*/React.createElement(Tag, {
+      tone: e.status === "done" ? "teal" : "amber"
+    }, e.status === "done" ? `Done · ${e.site}` : "Skipped") : /*#__PURE__*/React.createElement(Btn, {
+      onClick: () => onLog(p, ph, sel)
+    }, "Log")));
+  })));
+}
+
+// ---------- App ----------
+function App() {
+  const [tab, setTab] = useState("today");
+  const [products, setProducts] = useState([]);
+  const [entries, setEntries] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [editing, setEditing] = useState(null); // null | "new" | product
+  const [logTarget, setLogTarget] = useState(null); // {product, phase, iso}
+  const [status, setStatus] = useState("");
+  const [showBackup, setShowBackup] = useState(false);
+  const [importText, setImportText] = useState("");
+  const today = toISO(new Date());
+  useEffect(() => {
+    (async () => {
+      if (!window.storage) {
+        setStatus("Storage not available here. Use Backup to export your data.");
+        setLoaded(true);
+        return;
+      }
+      try {
+        const r = await window.storage.get(STORE_KEY, false);
+        if (r?.value) {
+          const d = JSON.parse(r.value);
+          setProducts(d.products || []);
+          setEntries(d.entries || []);
+          setStatus(`Loaded ${(d.products || []).length} product(s)`);
+        } else setStatus("Nothing saved yet");
+      } catch (e) {
+        setStatus("Nothing saved yet");
+      }
+      setLoaded(true);
+    })();
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      if (!window.storage) return;
+      try {
+        const r = await window.storage.set(STORE_KEY, JSON.stringify({
+          products,
+          entries
+        }), false);
+        setStatus(r ? `Saved ${new Date().toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit"
+        })}` : "Save failed: no response from storage");
+      } catch (e) {
+        setStatus("Save failed: " + (e?.message || e));
+      }
+    })();
+  }, [products, entries, loaded]);
+  const exportJSON = () => JSON.stringify({
+    products,
+    entries
+  });
+  const importJSON = () => {
+    try {
+      const d = JSON.parse(importText);
+      setProducts(d.products || []);
+      setEntries(d.entries || []);
+      setImportText("");
+      setShowBackup(false);
+    } catch {
+      setStatus("Import failed: that text is not valid backup data");
+    }
+  };
+  const saveProduct = p => {
+    setProducts(ps => ps.some(x => x.id === p.id) ? ps.map(x => x.id === p.id ? p : x) : [...ps, p]);
+    setEditing(null);
+    setTab("products");
+  };
+  const deleteProduct = id => {
+    if (!confirm("Delete this product and its log entries?")) return;
+    setProducts(ps => ps.filter(x => x.id !== id));
+    setEntries(es => es.filter(e => e.productId !== id));
+  };
+  const newVial = p => {
+    if (!confirm(`Start a new vial of ${p.name}? This discards what is left in the current one and uses one sealed vial.`)) return;
+    setProducts(ps => ps.map(x => x.id === p.id ? {
+      ...x,
+      vialOpened: today,
+      vialUsedMl: 0,
+      vialsOnHand: Math.max(0, x.vialsOnHand - 1)
+    } : x));
+  };
+  const saveLog = data => {
+    const {
+      product,
+      iso
+    } = logTarget;
+    setEntries(es => [...es, {
+      id: uid(),
+      productId: product.id,
+      date: iso,
+      ...data
+    }]);
+    if (data.status === "done") {
+      const ml = mlFor(product, data.doseMg);
+      setProducts(ps => ps.map(x => x.id === product.id ? {
+        ...x,
+        vialOpened: x.vialOpened || iso,
+        vialUsedMl: (x.vialUsedMl || 0) + ml
+      } : x));
+    }
+    setLogTarget(null);
+  };
+  const todayDue = products.filter(p => dueOn(p, today));
+  const alerts = products.flatMap(p => {
+    const s = supply(p, today);
+    const a = [];
+    if (s.daysToExpiry !== null && s.daysToExpiry <= 5) a.push(`${p.name}: open vial ${s.daysToExpiry < 0 ? "expired" : `expires in ${s.daysToExpiry} days`}`);
+    if (s.perWeek && s.total <= s.perWeek * 2) a.push(`${p.name}: ${s.total} draws left. Reorder.`);
+    return a;
+  });
+  const tabs = [["today", "Today"], ["products", "Products"], ["calendar", "Calendar"], ["log", "Log"]];
+  if (!loaded) return /*#__PURE__*/React.createElement("div", {
+    className: "p-6 text-sm",
+    style: {
+      color: C.mute
+    }
+  }, "Loading…");
+  return /*#__PURE__*/React.createElement("div", {
+    className: "min-h-screen",
+    style: {
+      background: C.bg,
+      fontFamily: "system-ui, -apple-system, sans-serif"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "max-w-md mx-auto px-4 pt-5 pb-24"
+  }, editing ? /*#__PURE__*/React.createElement(ProductForm, {
+    initial: editing === "new" ? null : editing,
+    onSave: saveProduct,
+    onCancel: () => setEditing(null)
+  }) : tab === "today" ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "text-sm",
+    style: {
+      color: C.mute
+    }
+  }, fromISO(today).toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric"
+  })), /*#__PURE__*/React.createElement("h1", {
+    className: "text-2xl font-semibold mb-4",
+    style: {
+      color: C.ink
+    }
+  }, todayDue.length ? `${todayDue.length} injection${todayDue.length > 1 ? "s" : ""} today` : "Nothing due today"), alerts.map((a, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "rounded-lg px-3 py-2 mb-2 text-sm",
+    style: {
+      background: C.amberSoft,
+      color: C.amber
+    }
+  }, a)), products.length === 0 && /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+    className: "text-sm mb-3",
+    style: {
+      color: C.mute
+    }
+  }, "No products yet. Add one to build your schedule."), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => setEditing("new")
+  }, "Add a product")), todayDue.map(p => {
+    const ph = dueOn(p, today);
+    const e = entries.find(x => x.date === today && x.productId === p.id);
+    return /*#__PURE__*/React.createElement(Card, {
+      key: p.id
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between items-center"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      className: "font-semibold",
+      style: {
+        color: C.ink
+      }
+    }, p.name, " ", /*#__PURE__*/React.createElement("span", {
+      className: "font-normal text-sm",
+      style: {
+        color: C.mute
+      }
+    }, "· ", p.timing)), /*#__PURE__*/React.createElement("div", {
+      className: "text-3xl font-semibold mt-1",
+      style: {
+        color: C.teal,
+        lineHeight: 1.1
+      }
+    }, fmt(unitsFor(p, Number(ph.doseMg))), " ", /*#__PURE__*/React.createElement("span", {
+      className: "text-sm font-normal",
+      style: {
+        color: C.mute
+      }
+    }, "units · ", ph.doseMg, " mg"))), e ? /*#__PURE__*/React.createElement(Tag, {
+      tone: e.status === "done" ? "teal" : "amber"
+    }, e.status === "done" ? `Done ${e.time}` : "Skipped") : /*#__PURE__*/React.createElement(Btn, {
+      onClick: () => setLogTarget({
+        product: p,
+        phase: ph,
+        iso: today
+      })
+    }, "Log")));
+  }), products.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-6"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "font-semibold mb-2",
+    style: {
+      color: C.ink
+    }
+  }, "Coming up"), [1, 2, 3, 4, 5, 6, 7].map(n => {
+    const iso = addDays(today, n);
+    const d = products.filter(p => dueOn(p, iso));
+    if (!d.length) return null;
+    const dt = fromISO(iso);
+    return /*#__PURE__*/React.createElement("div", {
+      key: iso,
+      className: "flex gap-3 py-2",
+      style: {
+        borderBottom: `1px solid ${C.line}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex flex-col items-center rounded-lg py-1",
+      style: {
+        width: 48,
+        background: C.tealSoft,
+        color: C.teal,
+        flexShrink: 0
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "text-xs uppercase"
+    }, dt.toLocaleDateString("en-US", {
+      weekday: "short"
+    })), /*#__PURE__*/React.createElement("span", {
+      className: "text-lg font-semibold",
+      style: {
+        lineHeight: 1.1
+      }
+    }, dt.getDate())), /*#__PURE__*/React.createElement("div", {
+      className: "flex-1 min-w-0"
+    }, d.map(p => {
+      const ph = dueOn(p, iso);
+      return /*#__PURE__*/React.createElement("div", {
+        key: p.id,
+        className: "flex justify-between items-baseline text-sm py-0.5"
+      }, /*#__PURE__*/React.createElement("span", {
+        className: "truncate",
+        style: {
+          color: C.ink
+        }
+      }, p.name), /*#__PURE__*/React.createElement("span", {
+        className: "ml-2 whitespace-nowrap",
+        style: {
+          color: C.mute
+        }
+      }, fmt(unitsFor(p, Number(ph.doseMg))), " u · ", ph.doseMg, " mg"));
+    })));
+  }))) : tab === "products" ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between items-center mb-1"
+  }, /*#__PURE__*/React.createElement("h1", {
+    className: "text-2xl font-semibold",
+    style: {
+      color: C.ink
+    }
+  }, "Products"), /*#__PURE__*/React.createElement(Btn, {
+    onClick: () => setEditing("new")
+  }, "+ Add")), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-between items-center text-xs mb-4",
+    style: {
+      color: status.startsWith("Save failed") || status.startsWith("Storage") ? C.amber : C.mute
+    }
+  }, /*#__PURE__*/React.createElement("span", null, status), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowBackup(!showBackup),
+    style: {
+      color: C.teal
+    }
+  }, "Backup")), showBackup && /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+    className: "text-sm mb-2",
+    style: {
+      color: C.ink
+    }
+  }, "Copy this text somewhere safe (Notes, email to yourself). Paste it back below to restore."), /*#__PURE__*/React.createElement("textarea", {
+    readOnly: true,
+    value: exportJSON(),
+    rows: 4,
+    onFocus: e => e.target.select(),
+    className: "w-full rounded-lg px-3 py-2 text-xs mb-2",
+    style: inputStyle
+  }), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: () => {
+      try {
+        navigator.clipboard.writeText(exportJSON());
+        setStatus("Copied backup to clipboard");
+      } catch {
+        setStatus("Select the text above and copy it manually");
+      }
+    },
+    className: "mb-3"
+  }, "Copy backup"), /*#__PURE__*/React.createElement("textarea", {
+    value: importText,
+    onChange: e => setImportText(e.target.value),
+    rows: 3,
+    placeholder: "Paste backup text here",
+    className: "w-full rounded-lg px-3 py-2 text-xs mb-2",
+    style: inputStyle
+  }), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    disabled: !importText,
+    onClick: importJSON,
+    style: {
+      opacity: importText ? 1 : 0.4
+    }
+  }, "Restore from backup")), products.length === 0 && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm",
+    style: {
+      color: C.mute
+    }
+  }, "Nothing here yet."), products.map(p => /*#__PURE__*/React.createElement(ProductCard, {
+    key: p.id,
+    p: p,
+    iso: today,
+    entries: entries,
+    onEdit: () => setEditing(p),
+    onDelete: () => deleteProduct(p.id),
+    onNewVial: () => newVial(p)
+  }))) : tab === "calendar" ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
+    className: "text-2xl font-semibold mb-4",
+    style: {
+      color: C.ink
+    }
+  }, "Calendar"), /*#__PURE__*/React.createElement(Calendar, {
+    products: products,
+    entries: entries,
+    today: today,
+    onLog: (product, phase, iso) => setLogTarget({
+      product,
+      phase,
+      iso
+    })
+  })) : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
+    className: "text-2xl font-semibold mb-4",
+    style: {
+      color: C.ink
+    }
+  }, "Injection log"), entries.length === 0 && /*#__PURE__*/React.createElement("div", {
+    className: "text-sm",
+    style: {
+      color: C.mute
+    }
+  }, "No injections logged yet."), [...entries].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)).map(e => {
+    const p = products.find(x => x.id === e.productId);
+    return /*#__PURE__*/React.createElement(Card, {
+      key: e.id
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "flex justify-between"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      className: "font-medium",
+      style: {
+        color: C.ink
+      }
+    }, p?.name || "Deleted product"), /*#__PURE__*/React.createElement("div", {
+      className: "text-sm",
+      style: {
+        color: C.mute
+      }
+    }, e.date, " ", e.time, e.status === "done" ? ` · ${e.doseMg} mg · ${fmt(e.units)} u · ${e.site}` : " · skipped"), e.notes && /*#__PURE__*/React.createElement("div", {
+      className: "text-sm mt-1",
+      style: {
+        color: C.ink
+      }
+    }, e.notes)), /*#__PURE__*/React.createElement("button", {
+      onClick: () => {
+        if (confirm("Remove this entry? Vial usage is not restored.")) setEntries(es => es.filter(x => x.id !== e.id));
+      },
+      className: "text-sm self-start",
+      style: {
+        color: C.mute
+      }
+    }, "✕")));
+  }))), !editing && /*#__PURE__*/React.createElement("div", {
+    className: "fixed bottom-0 left-0 right-0",
+    style: {
+      background: C.card,
+      borderTop: `1px solid ${C.line}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex"
+  }, tabs.map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    onClick: () => setTab(k),
+    className: "flex-1 py-3 text-sm font-medium",
+    style: {
+      color: tab === k ? C.teal : C.mute,
+      borderTop: `2px solid ${tab === k ? C.teal : "transparent"}`
+    }
+  }, l))), /*#__PURE__*/React.createElement("div", {
+    className: "text-center pb-1",
+    style: {
+      color: C.line,
+      fontSize: 10
+    }
+  }, "Peptide Tracker v", APP_VERSION)), logTarget && /*#__PURE__*/React.createElement(LogModal, {
+    product: logTarget.product,
+    phase: logTarget.phase,
+    iso: logTarget.iso,
+    onSave: saveLog,
+    onClose: () => setLogTarget(null)
+  }));
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
